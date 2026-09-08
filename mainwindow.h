@@ -4,6 +4,8 @@
 #include <QString>
 
 class QPlainTextEdit;
+class SessionServer;
+class SessionClient;
 
 class MainWindow : public QMainWindow {
     public:
@@ -15,7 +17,11 @@ class MainWindow : public QMainWindow {
         void saveFile();
         bool writeFile(const QString &filePath);
         void updateWindowTitle();
+        void hostSession();
+        void joinSession();
 
         QPlainTextEdit *m_editor;
         QString m_currentFilePath;
+        SessionServer *m_sessionServer;
+        SessionClient *m_sessionClient;
 };

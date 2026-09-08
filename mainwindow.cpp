@@ -1,4 +1,6 @@
 #include "mainwindow.h"
+#include "sessionserver.h"
+#include "sessionclient.h"
 
 #include <QAction>
 #include <QFile>
@@ -10,8 +12,10 @@
 #include <QMessageBox>
 #include <QPlainTextEdit>
 #include <QSaveFile>
+#include <QStatusBar>
+#include <QScrollBar>
 
-MainWindow::MainWindow(QWidget *parent):QMainWindow(parent), m_editor(new QPlainTextEdit(this)) {
+MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent), m_editor(new QPlainTextEdit(this)), m_sessionServer(new SessionServer(this)), m_sessionClient(new SessionClient(this)) {
     setCentralWidget(m_editor);
     resize(900, 650);
 
@@ -29,7 +33,61 @@ MainWindow::MainWindow(QWidget *parent):QMainWindow(parent), m_editor(new QPlain
     saveAction->setShortcut(QKeySequence::Save);
     connect(saveAction, &QAction::triggered, this, &MainWindow::saveFile);
 
-    updateWindowTitle();
+    QMenu *collaborationMenu = menuBar()->addMenu(tr("&Collaboration"));
+    QAction *hostAction = collaborationMenu->addAction(tr("&Host Session"));
+    connect(hostAction, &QAction::triggered, this, &MainWindow::hostSession);
+
+    statusBar()->showMessage(tr("Ready"));
+
+    connect(m_sessionServer, &SessionServer::clientConnected, this, [this](const QString &address) {
+        statusBar()->showMessage(tr("Client connected: %1").arg(address));
+    });
+
+    connect(m_sessionServer, &SessionServer::clientDisconnected, this, [this](const QString &address) {
+        statusBar()->showMessage(tr("Client disconnected: %1").arg(address));
+    });
+
+    QAction *joinAction = collaborationMenu->addAction(tr("&Join Session"));
+    connect(joinAction, &QAction::triggered, this, &MainWindow::joinSession);
+    connect(m_sessionClient, &SessionClient::connected, this, [this]() {
+        statusBar()->showMessage(tr("Connected to host"));
+    });
+    connect(m_sessionClient, &SessionClient::disconnected, this, [this]() {
+        statusBar()->showMessage(tr("Disconnected from host"));
+    });
+    connect(m_sessionClient,&SessionClient::connectionError, this, [this](const QString &message) {
+        statusBar()->showMessage(tr("Connection error: %1").arg(message));
+    });
+
+    connect(m_editor, &QPlainTextEdit::textChanged, this, [this]() {
+        m_sessionServer->setDocumentText(m_editor->toPlainText());
+    });
+
+    m_sessionServer->setDocumentText(m_editor->toPlainText());
+
+    connect(m_sessionClient, &SessionClient::activeChanged, this, [this, fileMenu](bool active) {
+        m_editor->setReadOnly(active);
+
+        for (QAction *action : fileMenu->actions()) {
+            action->setEnabled(!active);
+        }
+    });
+
+    connect(m_sessionClient, &SessionClient::documentReceived, this, [this](const QString &text) {
+        m_currentFilePath.clear();
+        
+        if (m_editor->toPlainText() != text) {
+            const int vertical = m_editor->verticalScrollBar()->value();
+            const int horizontal = m_editor->horizontalScrollBar()->value();
+
+            m_editor->setPlainText(text);
+            m_editor->verticalScrollBar()->setValue(vertical);
+            m_editor->horizontalScrollBar()->setValue(horizontal);
+        }
+
+        setWindowTitle(tr("Shared document - CollaboWrite"));
+        statusBar()->showMessage(tr("Connected - live updates"));
+    });
 }
 
 void MainWindow::newPage() {
@@ -104,4 +162,26 @@ bool MainWindow::writeFile(const QString &filePath) {
 void MainWindow::updateWindowTitle() {
     const QString name = m_currentFilePath.isEmpty() ? tr("New Page") : QFileInfo(m_currentFilePath).fileName();
     setWindowTitle(tr("%1 - CollaboWrite").arg(name));
+}
+
+void MainWindow::hostSession() {
+    if(m_sessionServer->isListening() || m_sessionClient->isActive()) {
+        return;
+    }
+
+    if (!m_sessionServer->start(45454)) {
+        QMessageBox::critical(this, tr("Could not host session"), m_sessionServer->errorString());
+        return;
+    }
+
+    statusBar()->showMessage(tr("Hosting on port 45454"));
+}
+
+void MainWindow::joinSession() {
+    if (m_sessionServer->isListening() || m_sessionClient->isActive()) {
+        return;
+    }
+
+    statusBar()->showMessage(tr("Connecting to host"));
+    m_sessionClient->connectToHost(QStringLiteral("127.0.0.1"), 45454);
 }
