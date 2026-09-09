@@ -1,5 +1,7 @@
 #pragma once
 
+#include "protocol.h"
+
 #include <QList>
 #include <QObject>
 #include <QString>
@@ -19,6 +21,8 @@ class SessionServer : public QObject {
         bool isListening() const;
         QString errorString() const;
         void setDocumentText(const QString &text);
+        quint64 revision() const;
+        bool applyEdit(const Protocol::EditRequest &request, QString &error);
     
     signals:
         void clientConnected(const QString &address);
@@ -29,6 +33,7 @@ class SessionServer : public QObject {
         void sendSnapshot(QTcpSocket *client);
         void broadcastSnapshot();
         QString m_documentText;
+        quint64 m_revision = 0;
     
     QTcpServer *m_server;
     QList<QTcpSocket *> m_clients;

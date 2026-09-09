@@ -1,6 +1,8 @@
 #include "mainwindow.h"
 #include "sessionserver.h"
 #include "sessionclient.h"
+#include "textedit.h"
+#include "protocol.h"
 
 #include <QAction>
 #include <QFile>
@@ -14,6 +16,7 @@
 #include <QSaveFile>
 #include <QStatusBar>
 #include <QScrollBar>
+#include <QScopedValueRollback>
 
 MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent), m_editor(new QPlainTextEdit(this)), m_sessionServer(new SessionServer(this)), m_sessionClient(new SessionClient(this)) {
     setCentralWidget(m_editor);
@@ -59,8 +62,47 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent), m_editor(new QPla
         statusBar()->showMessage(tr("Connection error: %1").arg(message));
     });
 
+    m_previousText = m_editor->toPlainText();
     connect(m_editor, &QPlainTextEdit::textChanged, this, [this]() {
-        m_sessionServer->setDocumentText(m_editor->toPlainText());
+        const QString currentText = m_editor->toPlainText();
+        
+        if (m_applyingRemoteText) {
+            m_previousText = currentText;
+            return;
+        }
+
+        if (currentText == m_previousText) {
+            return;
+        }
+
+        const TextEdit edit = makeTextEdit(m_previousText, currentText);
+        m_previousText = currentText;
+
+        if (m_sessionClient->isActive()) {
+            return;
+        }
+
+        if (!m_sessionServer->isListening()) {
+            m_sessionServer->setDocumentText(currentText);
+            return;
+        }
+
+        const Protocol::EditRequest request {
+            QUuid::createUuid(),
+            m_sessionServer->revision(),
+            edit
+        };
+
+        QString error;
+        if (!m_sessionServer->applyEdit(request, error)) {
+            m_sessionServer->stop();
+            m_sessionServer->setDocumentText(currentText);
+
+            statusBar()->showMessage(tr("Sharing stopped; your text is kept here. %1").arg(error));
+            return;
+        }
+
+        statusBar()->showMessage(tr("Hosting - revision %1").arg(m_sessionServer->revision()));
     });
 
     m_sessionServer->setDocumentText(m_editor->toPlainText());
@@ -73,7 +115,8 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent), m_editor(new QPla
         }
     });
 
-    connect(m_sessionClient, &SessionClient::documentReceived, this, [this](const QString &text) {
+    connect(m_sessionClient, &SessionClient::documentReceived, this, [this](const QString &text, quint64 revision) {
+        QScopedValueRollback<bool> remoteGuard(m_applyingRemoteText, true);
         m_currentFilePath.clear();
         
         if (m_editor->toPlainText() != text) {
@@ -86,7 +129,7 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent), m_editor(new QPla
         }
 
         setWindowTitle(tr("Shared document - CollaboWrite"));
-        statusBar()->showMessage(tr("Connected - live updates"));
+        statusBar()->showMessage(tr("Connected - revision %1").arg(revision));
     });
 }
 
@@ -169,12 +212,22 @@ void MainWindow::hostSession() {
         return;
     }
 
+    const QString text = m_editor->toPlainText();
+
+    if (!text.isValidUtf16() || text.toUtf8().size() > Protocol::MaxDocumentBytes) {
+        QMessageBox::warning(this, tr("Cannot host document"), tr("Sharing requires valid Unicode text and at most %1 UTF-8 bytes.").arg(Protocol::MaxDocumentBytes));
+        return;
+    }
+
+    m_sessionServer->setDocumentText(text);
+    m_previousText = text;
+
     if (!m_sessionServer->start(45454)) {
         QMessageBox::critical(this, tr("Could not host session"), m_sessionServer->errorString());
         return;
     }
 
-    statusBar()->showMessage(tr("Hosting on port 45454"));
+    statusBar()->showMessage(tr("Hosting on port 45454 - revision 0"));
 }
 
 void MainWindow::joinSession() {

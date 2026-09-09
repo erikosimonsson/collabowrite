@@ -3,6 +3,7 @@
 
 #include <QTcpSocket>
 #include <QtEndian>
+#include <QStringDecoder>
 
 SessionClient::SessionClient(QObject *parent) : QObject(parent), m_socket(new QTcpSocket(this)) {
     connect(m_socket, &QTcpSocket::connected, this, &SessionClient::connected);
@@ -28,6 +29,7 @@ void SessionClient::connectToHost(const QString &address, quint16 port) {
     }
 
     m_receiveBuffer.clear();
+    m_revision = 0;
     m_socket->connectToHost(address, port);
 }
 
@@ -58,7 +60,22 @@ void SessionClient::recieveData() {
         m_receiveBuffer.remove(0, frameSize);
 
         if (type == Protocol::MessageType::DocumentSnapshot) {
-            emit documentReceived(QString::fromUtf8(payload));
+            if (payload.size() < Protocol::SnapshotMetadataSize) {
+                failConnection(tr("Invalid document snapshot."));
+                return;
+            }
+
+            const quint64 revision = qFromBigEndian<quint64>(payload.constData());
+            QStringDecoder decoder(QStringDecoder::Utf8, QStringConverter::Flag::Stateless | QStringConverter::Flag::ConvertInitialBom);
+            const QString text = decoder(payload.mid(Protocol::SnapshotMetadataSize));
+
+            if (decoder.hasError()) {
+                failConnection(tr("Invalid UTF-8 in document snapshot."));
+                return;
+            }
+
+            m_revision = revision;
+            emit documentReceived(text, revision);
         }
         else if (type == Protocol::MessageType::Error) {
             failConnection(QString::fromUtf8(payload));

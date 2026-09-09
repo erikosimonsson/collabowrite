@@ -6,6 +6,7 @@
 #include <QTcpSocket>
 #include <QDataStream>
 #include <QTimer>
+#include <limits>
 
 SessionServer::SessionServer(QObject *parent) : QObject(parent), m_server(new QTcpServer(this)), m_broadcastTimer(new QTimer(this)) {
     connect(m_server, &QTcpServer::newConnection, this, &SessionServer::acceptPendingConnections);
@@ -64,24 +65,31 @@ void SessionServer::acceptPendingConnections() {
 }
 
 void SessionServer::setDocumentText(const QString &text) {
-    if (m_documentText == text) {
+    Q_ASSERT(!isListening());
+
+    if (isListening()) {
         return;
     }
 
     m_documentText = text;
-
-    if (isListening() && !m_broadcastTimer->isActive()) {
-        m_broadcastTimer->start();
-    }
+    m_revision = 0;
 }
 
 void SessionServer::sendSnapshot(QTcpSocket *client) {
-    QByteArray payload = m_documentText.toUtf8();
+    QByteArray payload;
     auto type = Protocol::MessageType::DocumentSnapshot;
+    const QByteArray text = m_documentText.toUtf8();
 
-    if (payload.size() > Protocol::MaxPayloadSize - 1) {
+    if (!m_documentText.isValidUtf16() ||text.size() > Protocol::MaxDocumentBytes) {
         type = Protocol::MessageType::Error;
-        payload = "Document is too large. Maximum payload size is 1 MiB.";
+        payload = "Document cannot be shared: invalid text or size limit exceeded.";
+    }
+    else {
+        QDataStream snapshot(&payload, QIODevice::WriteOnly);
+        snapshot.setVersion(QDataStream::Qt_6_5);
+        snapshot.setByteOrder(QDataStream::BigEndian);
+        snapshot << m_revision;
+        payload.append(text);
     }
 
     QByteArray frame;
@@ -112,4 +120,61 @@ void SessionServer::broadcastSnapshot() {
             sendSnapshot(client);
         }
     }
+}
+
+quint64 SessionServer::revision() const {
+    return m_revision;
+}
+
+bool SessionServer::applyEdit(const Protocol::EditRequest &request, QString &error) {
+    error.clear();
+
+    if (!isListening()) {
+        error = tr("No session is running.");
+        return false;
+    }
+
+    if (request.baseRevision != m_revision) {
+        error = tr("Edit uses revision %1, but the host is at revision %2.").arg(request.baseRevision).arg(m_revision);
+        return false;
+    }
+
+    const TextEdit &edit = request.edit;
+    const qsizetype size = m_documentText.size();
+
+    if (request.operationId.isNull() || edit.position < 0 || edit.position > size || edit.removedLength < 0 || edit.removedLength > size - edit.position || !edit.insertedText.isValidUtf16()) {
+        error = tr("Invalid text edit.");
+        return false;
+    }
+
+    const auto splitsSurrogatePair = [this](qsizetype position) {
+        return position > 0 && position < m_documentText.size() && m_documentText.at(position - 1).isHighSurrogate() && m_documentText.at(position).isLowSurrogate();
+    };
+
+    if (splitsSurrogatePair(edit.position) || splitsSurrogatePair(edit.position + edit.removedLength)) {
+        error = tr("Edit would split a Unicode character.");
+        return false;
+    }
+
+    if (m_revision == std::numeric_limits<quint64>::max()) {
+        error = tr("Revision limit reached. Start a new session.");
+        return false;
+    }
+
+    QString updated = m_documentText;
+    updated.replace(edit.position, edit.removedLength, edit.insertedText);
+
+    if (updated.toUtf8().size() > Protocol::MaxDocumentBytes) {
+        error = tr("Document exceeds the sharing size limit.");
+        return false;
+    }
+
+    m_documentText = updated;
+    ++m_revision;
+
+    if (!m_broadcastTimer->isActive()) {
+        m_broadcastTimer->start();
+    }
+
+    return true;
 }

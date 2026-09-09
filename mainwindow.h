@@ -24,4 +24,6 @@ class MainWindow : public QMainWindow {
         QString m_currentFilePath;
         SessionServer *m_sessionServer;
         SessionClient *m_sessionClient;
+        QString m_previousText;
+        bool m_applyingRemoteText = false;
 };
