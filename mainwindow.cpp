@@ -17,6 +17,7 @@
 #include <QStatusBar>
 #include <QScrollBar>
 #include <QScopedValueRollback>
+#include <QTextCursor>
 
 MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent), m_editor(new QPlainTextEdit(this)), m_sessionServer(new SessionServer(this)), m_sessionClient(new SessionClient(this)) {
     setCentralWidget(m_editor);
@@ -79,6 +80,7 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent), m_editor(new QPla
         m_previousText = currentText;
 
         if (m_sessionClient->isActive()) {
+            m_sessionClient->submitDraft(currentText);
             return;
         }
 
@@ -95,6 +97,7 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent), m_editor(new QPla
 
         QString error;
         if (!m_sessionServer->applyEdit(request, error)) {
+            m_editor->setUndoRedoEnabled(true);
             m_sessionServer->stop();
             m_sessionServer->setDocumentText(currentText);
 
@@ -106,29 +109,38 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent), m_editor(new QPla
     });
 
     m_sessionServer->setDocumentText(m_editor->toPlainText());
+    const auto updateClientUi = [this, fileMenu]() {
+        const bool active = m_sessionClient->isActive();
 
-    connect(m_sessionClient, &SessionClient::activeChanged, this, [this, fileMenu](bool active) {
-        m_editor->setReadOnly(active);
+        m_editor->setReadOnly(active && !m_sessionClient->isReady());
+        m_editor->setUndoRedoEnabled(!active && !m_sessionServer->isListening());
 
         for (QAction *action : fileMenu->actions()) {
             action->setEnabled(!active);
         }
-    });
+    };
+
+    connect(m_sessionClient, &SessionClient::activeChanged, this, updateClientUi);
+
+    connect(m_sessionClient, &SessionClient::readyChanged, this, updateClientUi);
+
+    updateClientUi();
 
     connect(m_sessionClient, &SessionClient::documentReceived, this, [this](const QString &text, quint64 revision) {
-        QScopedValueRollback<bool> remoteGuard(m_applyingRemoteText, true);
+        applyRemoteText(text);
         m_currentFilePath.clear();
-        
-        if (m_editor->toPlainText() != text) {
-            const int vertical = m_editor->verticalScrollBar()->value();
-            const int horizontal = m_editor->horizontalScrollBar()->value();
-
-            m_editor->setPlainText(text);
-            m_editor->verticalScrollBar()->setValue(vertical);
-            m_editor->horizontalScrollBar()->setValue(horizontal);
-        }
 
         setWindowTitle(tr("Shared document - CollaboWrite"));
+        statusBar()->showMessage(tr("Connected - revision %1").arg(revision));
+    });
+
+    connect(m_sessionServer, &SessionServer::remoteDocumentChanged, this, [this](const QString &text, quint64 revision) {
+        applyRemoteText(text);
+
+        statusBar()->showMessage(tr("Hosting - revision %1").arg(revision));
+    });
+
+    connect(m_sessionClient, &SessionClient::editAcknowledged, this, [this](quint64 revision) {
         statusBar()->showMessage(tr("Connected - revision %1").arg(revision));
     });
 }
@@ -227,6 +239,7 @@ void MainWindow::hostSession() {
         return;
     }
 
+    m_editor->setUndoRedoEnabled(false);
     statusBar()->showMessage(tr("Hosting on port 45454 - revision 0"));
 }
 
@@ -237,4 +250,30 @@ void MainWindow::joinSession() {
 
     statusBar()->showMessage(tr("Connecting to host"));
     m_sessionClient->connectToHost(QStringLiteral("127.0.0.1"), 45454);
+}
+
+void MainWindow::applyRemoteText(const QString &text) {
+    QScopedValueRollback<bool> remoteGuard(m_applyingRemoteText, true);
+    const QString before = m_editor->toPlainText();
+
+    if (before != text) {
+        const TextEdit edit = makeTextEdit(before, text);
+
+        const int vertical = m_editor->verticalScrollBar()->value();
+        const int horizontal = m_editor->horizontalScrollBar()->value();
+
+        QTextCursor cursor(m_editor->document());
+        cursor.beginEditBlock();
+
+        cursor.setPosition(int(edit.position));
+        cursor.setPosition(int(edit.position + edit.removedLength), QTextCursor::KeepAnchor);
+
+        cursor.insertText(edit.insertedText);
+        cursor.endEditBlock();
+
+        m_editor->verticalScrollBar()->setValue(vertical);
+        m_editor->horizontalScrollBar()->setValue(horizontal);
+    }
+
+    m_previousText = m_editor->toPlainText();
 }

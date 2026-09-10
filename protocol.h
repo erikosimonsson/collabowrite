@@ -17,17 +17,25 @@ namespace Protocol {
     inline constexpr qsizetype EditMetadataSize = 32;
     inline constexpr qsizetype SnapshotMetadataSize = 8;
     inline constexpr qsizetype MaxDocumentBytes = MaxPayloadSize - 1 - SnapshotMetadataSize;
+    inline constexpr qsizetype EditReplySize = 24;
 
     enum class MessageType : quint8 {
         DocumentSnapshot = 1,
         Error = 2,
-        EditRequest = 3
+        EditRequest = 3,
+        EditAccepted = 4,
+        EditRejected = 5
     };
 
     struct EditRequest {
         QUuid operationId;
         quint64 baseRevision = 0;
         TextEdit edit;
+    };
+
+    struct EditReply {
+        QUuid operationId;
+        quint64 revision = 0;
     };
 
     inline QByteArray encodeEditRequest(const EditRequest &request) {
@@ -95,6 +103,39 @@ namespace Protocol {
         };
 
         request = decoded;
+        return true;
+    }
+
+    inline QByteArray encodeEditReply(const EditReply &reply) {
+        if (reply.operationId.isNull()) {
+            return {};
+        }
+
+        QByteArray body;
+        QDataStream stream(&body, QIODevice::WriteOnly);
+        stream.setVersion(QDataStream::Qt_6_5);
+        stream.setByteOrder(QDataStream::BigEndian);
+        stream << reply.operationId << reply.revision;
+
+        return stream.status() == QDataStream::Ok ? body : QByteArray{};
+    }
+
+    inline bool decodeEditReply(const QByteArray &body, EditReply &reply) {
+        if (body.size() != EditReplySize) {
+            return false;
+        }
+
+        EditReply decoded;
+        QDataStream stream(body);
+        stream.setVersion(QDataStream::Qt_6_5);
+        stream.setByteOrder(QDataStream::BigEndian);
+        stream >> decoded.operationId >> decoded.revision;
+
+        if (stream.status() != QDataStream::Ok || decoded.operationId.isNull()) {
+            return false;
+        }
+
+        reply = decoded;
         return true;
     }
 }

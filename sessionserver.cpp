@@ -6,6 +6,7 @@
 #include <QTcpSocket>
 #include <QDataStream>
 #include <QTimer>
+#include <QtEndian>
 #include <limits>
 
 SessionServer::SessionServer(QObject *parent) : QObject(parent), m_server(new QTcpServer(this)), m_broadcastTimer(new QTimer(this)) {
@@ -30,6 +31,7 @@ void SessionServer::stop() {
 
     const QList<QTcpSocket *> clients = m_clients;
     m_clients.clear();
+    m_receiveBuffers.clear();
 
     for (QTcpSocket *client : clients) {
         QObject::disconnect(client, nullptr, this, nullptr);
@@ -49,11 +51,24 @@ QString SessionServer::errorString() const {
 void SessionServer::acceptPendingConnections() {
     while (m_server->hasPendingConnections()) {
         QTcpSocket *client = m_server->nextPendingConnection();
+        
+        if (!client) {
+            continue;
+        }
+
         m_clients.append(client);
+        m_receiveBuffers.insert(client, QByteArray{});
+
+        client->setReadBufferSize(Protocol::HeaderSize + Protocol::MaxPayloadSize);
 
         const QString address = QStringLiteral("%1:%2").arg(client->peerAddress().toString()).arg(client->peerPort());
 
+        connect(client, &QTcpSocket::readyRead, this, [this, client]() {
+            receiveFromClient(client);
+        });
+
         connect(client, &QTcpSocket::disconnected, this, [this, client, address]() {
+            m_receiveBuffers.remove(client);
             m_clients.removeOne(client);
             emit clientDisconnected(address);
             client->deleteLater();
@@ -61,6 +76,10 @@ void SessionServer::acceptPendingConnections() {
 
         emit clientConnected(address);
         sendSnapshot(client);
+
+        if (client->bytesAvailable() > 0) {
+            receiveFromClient(client);
+        }
     }
 }
 
@@ -92,24 +111,7 @@ void SessionServer::sendSnapshot(QTcpSocket *client) {
         payload.append(text);
     }
 
-    QByteArray frame;
-    QDataStream stream(&frame, QIODevice::WriteOnly);
-    stream.setByteOrder(QDataStream::BigEndian);
-    stream.setVersion(QDataStream::Qt_6_5);
-
-    stream << quint32(payload.size() + 1) << quint8(type);
-    frame.append(payload);
-
-    const qint64 maxQueuedBytes = 4 * (Protocol::HeaderSize + Protocol::MaxPayloadSize);
-
-    if (client->bytesToWrite() + frame.size() > maxQueuedBytes) {
-        client->abort();
-        return;
-    }
-
-    if (client->write(frame) != frame.size()) {
-        client->abort();
-    }
+    sendMessage(client, type, payload);
 }
 
 void SessionServer::broadcastSnapshot() {
@@ -177,4 +179,92 @@ bool SessionServer::applyEdit(const Protocol::EditRequest &request, QString &err
     }
 
     return true;
+}
+
+bool SessionServer::sendMessage(QTcpSocket *client, Protocol::MessageType type, const QByteArray &payload) {
+    if (client->state() != QAbstractSocket::ConnectedState) {
+        return false;
+    }
+
+    if (payload.size() > Protocol::MaxPayloadSize - 1) {
+        client->abort();
+        return false;
+    }
+
+    QByteArray frame;
+    QDataStream stream(&frame, QIODevice::WriteOnly);
+    stream.setVersion(QDataStream::Qt_6_5);
+    stream.setByteOrder(QDataStream::BigEndian);
+    stream << quint32(payload.size() + 1) << quint8(type);
+    frame.append(payload);
+
+    const qint64 maxQueuedBytes = 4 * (Protocol::HeaderSize + Protocol::MaxPayloadSize);
+
+    if (stream.status() != QDataStream::Ok || client->bytesToWrite() + frame.size() > maxQueuedBytes || client->write(frame) != frame.size()) {
+        client->abort();
+        return false;
+    }
+
+    return true;
+}
+
+void SessionServer::receiveFromClient(QTcpSocket *client) {
+    if (!m_receiveBuffers.contains(client)) {
+        return;
+    }
+
+    m_receiveBuffers[client].append(client->readAll());
+
+    while (client->state() == QAbstractSocket::ConnectedState && m_receiveBuffers.contains(client)) {
+        Protocol::MessageType type;
+        QByteArray payload;
+
+        {
+            QByteArray &buffer = m_receiveBuffers[client];
+
+            if (buffer.size() < Protocol::HeaderSize) {
+                return;
+            }
+
+            const quint32 payloadSize = qFromBigEndian<quint32>(buffer.constData());
+
+            if (payloadSize == 0 || payloadSize > Protocol::MaxPayloadSize) {
+                client->abort();
+                return;
+            }
+
+            const qsizetype frameSize = Protocol::HeaderSize + payloadSize;
+
+            if (buffer.size() < frameSize) {
+                return;
+            }
+
+            type = static_cast<Protocol::MessageType>(static_cast<quint8>(buffer.at(Protocol::HeaderSize)));
+            payload = buffer.mid(Protocol::HeaderSize + 1, payloadSize - 1);
+            buffer.remove(0, frameSize);
+        }
+
+        Protocol::EditRequest request;
+
+        if (type != Protocol::MessageType::EditRequest || !Protocol::decodeEditRequest(payload, request)) {
+            client->abort();
+            return;
+        }
+
+        QString error;
+        const bool accepted = applyEdit(request, error);
+        const quint64 replyRevision = m_revision;
+        const QString confirmedText = m_documentText;
+
+        const Protocol::EditReply reply {
+            request.operationId,
+            replyRevision
+        };
+
+        sendMessage(client, accepted ? Protocol::MessageType::EditAccepted : Protocol::MessageType::EditRejected, Protocol::encodeEditReply(reply));
+
+        if (accepted) {
+            emit remoteDocumentChanged(confirmedText, replyRevision);
+        }
+    }
 }

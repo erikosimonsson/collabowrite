@@ -6,6 +6,8 @@
 #include <QObject>
 #include <QString>
 #include <QtGlobal>
+#include <QByteArray>
+#include <QHash>
 
 class QTcpServer;
 class QTcpSocket;
@@ -27,14 +29,18 @@ class SessionServer : public QObject {
     signals:
         void clientConnected(const QString &address);
         void clientDisconnected(const QString &address);
+        void remoteDocumentChanged(const QString &text, quint64 revision);
 
     private:
         void acceptPendingConnections();
         void sendSnapshot(QTcpSocket *client);
         void broadcastSnapshot();
-        QString m_documentText;
-        quint64 m_revision = 0;
+        void receiveFromClient(QTcpSocket *client);
+        bool sendMessage(QTcpSocket *client, Protocol::MessageType type, const QByteArray &payload);
     
+    QHash<QTcpSocket *, QByteArray> m_receiveBuffers;
+    QString m_documentText;
+    quint64 m_revision = 0;
     QTcpServer *m_server;
     QList<QTcpSocket *> m_clients;
     QTimer *m_broadcastTimer;

@@ -19,11 +19,12 @@ class MainWindow : public QMainWindow {
         void updateWindowTitle();
         void hostSession();
         void joinSession();
+        void applyRemoteText(const QString &text);
 
-        QPlainTextEdit *m_editor;
-        QString m_currentFilePath;
-        SessionServer *m_sessionServer;
-        SessionClient *m_sessionClient;
-        QString m_previousText;
-        bool m_applyingRemoteText = false;
+    QPlainTextEdit *m_editor;
+    QString m_currentFilePath;
+    SessionServer *m_sessionServer;
+    SessionClient *m_sessionClient;
+    QString m_previousText;
+    bool m_applyingRemoteText = false;
 };
